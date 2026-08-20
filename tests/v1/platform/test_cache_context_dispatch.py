@@ -76,6 +76,7 @@ class _FakeContext(BaseCacheContext):
         engine_type: Any,
         separate_object_groups: bool = True,
         full_sw_kv: bool = False,
+        transfer_pipeline_depth: int = 1,
     ) -> None:
         # Skip ``BaseCacheContext.__init__`` -- it requires real
         # KVLayerGroupsManager / shape descriptors that are out of
@@ -87,6 +88,7 @@ class _FakeContext(BaseCacheContext):
         self.engine_type = engine_type
         self.separate_object_groups = separate_object_groups
         self.full_sw_kv = full_sw_kv
+        self.transfer_pipeline_depth_arg = transfer_pipeline_depth
 
     # ------------------------------------------------------------------
     # Abstract stubs -- never called from these tests.

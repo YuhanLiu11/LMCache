@@ -296,7 +296,14 @@ def _run_object_group_transfer_plan(
     copy and kernel launch immediately (each a GIL release/re-acquire), it
     resolves every argument to plain pointers/scalars (the "planner", GIL held
     throughout) and hands the whole plan to ``execute_object_group_transfer``,
-    which issues all of it on the stream within a single GIL release.
+    which issues all of it within a single GIL release.
+
+    When the cache context has a staging copy stream and the direction is H2D
+    (``transfer_pipeline_depth`` > 1), the plan rotates batch steps through
+    the context's staging slot ring and the native executor runs staging
+    copies on the copy stream, overlapped with the scatter kernels on the
+    context stream (see ``execute_object_group_transfer``). Otherwise the
+    plan degenerates to the legacy single-stream shape.
 
     Requires every object to be non-GDS (staged through the lazy-allocator
     path); the caller skips groups that contain any GDS-backed object.
@@ -321,6 +328,14 @@ def _run_object_group_transfer_plan(
     kernel_group_ids = object_group.kernel_group_indices
     is_h2d = direction == lmcache_native.TransferDirection.H2D
     max_batch_size = cache_context.max_batch_size
+    num_ring_slots = cache_context.num_ring_slots
+
+    # Dual-stream pipelining: retrieve (H2D) only in v1. Store keeps the
+    # single-stream path (copy_stream=0) until its stalls are re-profiled.
+    # When the pipeline is off, the plan below degenerates to the legacy
+    # shape: slot_offset 0 and wait_step -1 on every step.
+    copy_stream = cache_context.copy_stream_handle if is_h2d else 0
+    pipeline_depth = cache_context.transfer_pipeline_depth if copy_stream != 0 else 1
 
     # --- Per-kernel-group invariants, resolved once (vs. every batch before) ---
     kernel_group_specs: list[Any] = []
@@ -345,7 +360,7 @@ def _run_object_group_transfer_plan(
         block_ids_tensor = block_ids_gpu[kernel_group_id]
         temp_buffers = [
             cache_context.get_temp_kernel_group_buffer(slot, kernel_group_id)
-            for slot in range(max_batch_size)
+            for slot in range(num_ring_slots)
         ]
 
         spec_index_by_kg[kernel_group_id] = len(kernel_group_specs)
@@ -361,10 +376,10 @@ def _run_object_group_transfer_plan(
             )
         )
 
-    # Temp object-group staging buffers (reused per batch slot, like above).
+    # Temp object-group staging buffers (reused per ring slot, like above).
     object_group_buffers = [
         cache_context.get_temp_object_group_buffer(slot, object_group_id)
-        for slot in range(max_batch_size)
+        for slot in range(num_ring_slots)
     ]
 
     attn_desc = kv_groups_manager.get_attn_desc()
@@ -404,9 +419,24 @@ def _run_object_group_transfer_plan(
 
         skip_tokens_in_chunk = effective_start - batch_start_token
 
+        # Emitted steps (not iteration indices) drive the slot ring, so
+        # skipped/short batches never desynchronize slot_offset from
+        # wait_step. Step i uses slot set (i % depth) and must wait for the
+        # set's previous user, step i - depth.
+        emitted_step_idx = len(batch_steps)
+        slot_base = (emitted_step_idx % pipeline_depth) * max_batch_size
+        # Wait edges only exist when a second stream does; on the
+        # single-stream path (copy_stream == 0) stream order already
+        # serializes slot reuse and the plan keeps the legacy shape.
+        wait_step = (
+            emitted_step_idx - pipeline_depth
+            if copy_stream != 0 and emitted_step_idx >= pipeline_depth
+            else -1
+        )
+
         staging = build_staging_copies(
             memory_object_batch,
-            object_group_buffers[:batch_len],
+            object_group_buffers[slot_base : slot_base + batch_len],
             is_h2d,
         )
 
@@ -434,10 +464,11 @@ def _run_object_group_transfer_plan(
                     end_block_pos - start_block_pos,
                     batch_len,
                     recalculated_skip_blocks,
+                    slot_offset=slot_base,
                 )
             )
 
-        batch_steps.append(device_ops.BatchStep(staging, launches))
+        batch_steps.append(device_ops.BatchStep(staging, launches, wait_step=wait_step))
 
     if not batch_steps:
         return
@@ -449,6 +480,7 @@ def _run_object_group_transfer_plan(
         LazyMemoryAllocator.PIN_CHUNK_SIZE,
         kernel_group_specs,
         batch_steps,
+        copy_stream=copy_stream,
     )
 
 
@@ -926,6 +958,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             engine_type=engine_type,
             separate_object_groups=self._ctx.separate_object_groups,
             full_sw_kv=self._ctx.full_sw_kv,
+            transfer_pipeline_depth=self._ctx.transfer_pipeline_depth,
         )
         kv_groups_manager = cache_context.kv_layer_groups_manager
         num_object_groups = kv_groups_manager.num_object_groups

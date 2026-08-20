@@ -253,6 +253,7 @@ class MUSACacheContext(BaseCacheContext):
         engine_type: EngineType = EngineType.VLLM,
         separate_object_groups: bool = True,
         full_sw_kv: bool = False,
+        transfer_pipeline_depth: int = 1,
     ) -> None:
         """Build a MUSA cache context from IPC-wrapped KV tensors.
 
@@ -264,10 +265,14 @@ class MUSACacheContext(BaseCacheContext):
             engine_type: Serving engine that produced the KV cache.
             separate_object_groups: Whether to split object groups by window.
             full_sw_kv: Whether sliding-window groups transfer their full KV.
+            transfer_pipeline_depth: Accepted for signature parity with the
+                platform-agnostic factory; MUSA has no dedicated copy stream,
+                so transfers always run single-stream regardless of value.
 
         Raises:
             ValueError: If reconstructed tensors are not MUSA tensors.
         """
+        del transfer_pipeline_depth
         self._ipc_wrappers = tuple(kv_caches)
         try:
             self._initialize(

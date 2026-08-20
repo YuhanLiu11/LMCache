@@ -165,21 +165,22 @@ PYBIND11_MODULE(cuda_ops, m) {
            py::arg("dest"), py::arg("src"), py::arg("nbytes"),
            py::arg("host_offset"));
   py::class_<LaunchVar>(m, "LaunchVar")
-      .def(
-          py::init([](int group_idx, int64_t block_ids_offset, int total_blocks,
-                      int num_objects, int skip_prefix_n_blocks) {
-            return LaunchVar{group_idx, block_ids_offset, total_blocks,
-                             num_objects, skip_prefix_n_blocks};
-          }),
-          py::arg("group_idx"), py::arg("block_ids_offset"),
-          py::arg("total_blocks"), py::arg("num_objects"),
-          py::arg("skip_prefix_n_blocks"));
+      .def(py::init([](int group_idx, int64_t block_ids_offset,
+                       int total_blocks, int num_objects,
+                       int skip_prefix_n_blocks, int slot_offset) {
+             return LaunchVar{group_idx,   block_ids_offset,     total_blocks,
+                              num_objects, skip_prefix_n_blocks, slot_offset};
+           }),
+           py::arg("group_idx"), py::arg("block_ids_offset"),
+           py::arg("total_blocks"), py::arg("num_objects"),
+           py::arg("skip_prefix_n_blocks"), py::arg("slot_offset") = 0);
   py::class_<BatchStep>(m, "BatchStep")
       .def(py::init([](std::vector<StagingCopy> staging,
-                       std::vector<LaunchVar> launches) {
-             return BatchStep{std::move(staging), std::move(launches)};
+                       std::vector<LaunchVar> launches, int wait_step) {
+             return BatchStep{std::move(staging), std::move(launches),
+                              wait_step};
            }),
-           py::arg("staging"), py::arg("launches"));
+           py::arg("staging"), py::arg("launches"), py::arg("wait_step") = -1);
   py::class_<KernelGroupSpec>(m, "KernelGroupSpec")
       .def(py::init([](uintptr_t paged_buffer_ptrs,
                        std::vector<int64_t> lmcache_objects_ptrs,
@@ -204,14 +205,15 @@ PYBIND11_MODULE(cuda_ops, m) {
       [](int direction, const torch::Device& device,
          size_t host_buffer_alignment,
          const std::vector<KernelGroupSpec>& kernel_group_specs,
-         const std::vector<BatchStep>& batch_steps) {
+         const std::vector<BatchStep>& batch_steps, uintptr_t copy_stream) {
         return execute_object_group_transfer(
             static_cast<TransferDirection>(direction), device,
-            host_buffer_alignment, kernel_group_specs, batch_steps);
+            host_buffer_alignment, kernel_group_specs, batch_steps,
+            copy_stream);
       },
       py::arg("direction"), py::arg("device"), py::arg("host_buffer_alignment"),
       py::arg("kernel_group_specs"), py::arg("batch_steps"),
-      py::call_guard<py::gil_scoped_release>());
+      py::arg("copy_stream") = 0, py::call_guard<py::gil_scoped_release>());
   // CB retrieve plan spec (see blend_kernels.cuh). Built on the Python side
   // (blend_v3.cb_retrieve_pre_computed) and consumed by
   // execute_cb_retrieve_plan_flat.

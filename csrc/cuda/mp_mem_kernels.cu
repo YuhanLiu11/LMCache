@@ -471,17 +471,50 @@ void multi_layer_block_kv_transfer(
 
 #undef LAUNCH_TEMPLATED
 
+namespace {
+
+// Owns the plan's CUDA events; destroying a recorded-but-pending event is
+// legal (CUDA defers the destruction), so unwinding mid-plan is safe.
+struct EventPool {
+  std::vector<cudaEvent_t> events;
+
+  cudaEvent_t create() {
+    cudaEvent_t event = nullptr;
+    TORCH_CHECK(
+        cudaEventCreateWithFlags(&event, cudaEventDisableTiming) == cudaSuccess,
+        "cudaEventCreateWithFlags failed in execute_object_group_transfer");
+    events.push_back(event);
+    return event;
+  }
+
+  ~EventPool() {
+    for (cudaEvent_t event : events) {
+      cudaEventDestroy(event);
+    }
+  }
+};
+
+inline void check_cuda(cudaError_t err, const char* what) {
+  TORCH_CHECK(
+      err == cudaSuccess, what,
+      " failed in execute_object_group_transfer: ", cudaGetErrorString(err));
+}
+
+}  // namespace
+
 void execute_object_group_transfer(
     TransferDirection direction, const torch::Device& device,
     size_t host_buffer_alignment,
     const std::vector<KernelGroupSpec>& kernel_group_specs,
-    const std::vector<BatchStep>& batch_steps) {
+    const std::vector<BatchStep>& batch_steps, uintptr_t copy_stream) {
   // Set the device guard once for the whole plan so every staging copy and
-  // kernel launch below is enqueued on this device's current stream, in order.
+  // kernel launch below is enqueued on this device's stream(s), in order.
   const at::cuda::OptionalCUDAGuard device_guard(device);
   const bool is_h2d = (direction == TransferDirection::H2D);
   const auto int64_opts = at::TensorOptions().dtype(at::kLong).device(device);
 
+  // Issues on the CURRENT stream; the dual-stream path below redirects it by
+  // installing a stream guard around the call.
   const auto do_staging = [&](const std::vector<StagingCopy>& staging) {
     for (const auto& copy : staging) {
       lmcache_memcpy_async(copy.dest, copy.src, copy.nbytes, direction,
@@ -489,23 +522,22 @@ void execute_object_group_transfer(
     }
   };
 
-  for (const auto& step : batch_steps) {
-    // H2D stages CPU->GPU temp buffers before the kernel reads them; D2H stages
-    // GPU->CPU after the kernel writes them. The per-step ordering must be
-    // preserved because temp buffers are reused across steps.
-    if (is_h2d) {
-      do_staging(step.staging);
-    }
+  // Validates and issues one step's kernel launches on the current stream.
+  const auto run_launches = [&](const BatchStep& step) {
     for (const auto& launch : step.launches) {
       TORCH_CHECK(
           launch.group_idx >= 0 &&
               launch.group_idx < static_cast<int>(kernel_group_specs.size()),
           "LaunchVar.group_idx out of range: ", launch.group_idx);
       const KernelGroupSpec& group = kernel_group_specs[launch.group_idx];
+      TORCH_CHECK(launch.slot_offset >= 0,
+                  "LaunchVar.slot_offset must be non-negative, got ",
+                  launch.slot_offset);
       TORCH_CHECK(launch.num_objects >= 1 &&
-                      launch.num_objects <=
+                      launch.slot_offset + launch.num_objects <=
                           static_cast<int>(group.lmcache_objects_ptrs.size()),
-                  "LaunchVar.num_objects (", launch.num_objects,
+                  "LaunchVar slot slice [", launch.slot_offset, ", ",
+                  launch.slot_offset + launch.num_objects,
                   ") exceeds available temp buffers (",
                   group.lmcache_objects_ptrs.size(), ")");
       // Bounds-check the block_ids slice before the kernel dereferences it on
@@ -539,16 +571,142 @@ void execute_object_group_transfer(
           reinterpret_cast<void*>(block_ids_addr),
           {static_cast<int64_t>(launch.total_blocks)}, int64_opts);
       std::vector<int64_t> lmcache_objects_ptrs(
-          group.lmcache_objects_ptrs.begin(),
-          group.lmcache_objects_ptrs.begin() + launch.num_objects);
+          group.lmcache_objects_ptrs.begin() + launch.slot_offset,
+          group.lmcache_objects_ptrs.begin() + launch.slot_offset +
+              launch.num_objects);
 
       multi_layer_block_kv_transfer(
           paged_buffer_ptrs_tensor, std::move(lmcache_objects_ptrs), block_ids,
           device, direction, group.shape_desc, group.lmcache_chunk_size,
           group.engine_kv_format, launch.skip_prefix_n_blocks);
     }
-    if (!is_h2d) {
-      do_staging(step.staging);
+  };
+
+  if (copy_stream == 0) {
+    // Legacy single-stream path: byte-identical enqueue order to the
+    // pre-pipeline executor. H2D stages CPU->GPU temp buffers before the
+    // kernel reads them; D2H stages GPU->CPU after the kernel writes them.
+    // The per-step ordering must be preserved because temp buffers are
+    // reused across steps.
+    for (const auto& step : batch_steps) {
+      if (is_h2d) {
+        do_staging(step.staging);
+      }
+      run_launches(step);
+      if (!is_h2d) {
+        do_staging(step.staging);
+      }
     }
+    return;
   }
+
+  // --- Dual-stream path: staging on `copy`, kernels on `compute` ---
+  // An index-less device ("cuda") resolves to the current device, matching
+  // what the guard above and getCurrentCUDAStream() already did.
+  const c10::DeviceIndex device_index =
+      device.has_index() ? static_cast<c10::DeviceIndex>(device.index())
+                         : c10::cuda::current_device();
+  const at::cuda::CUDAStream compute =
+      at::cuda::getCurrentCUDAStream(device_index);
+  const at::cuda::CUDAStream copy = at::cuda::getStreamFromExternal(
+      reinterpret_cast<cudaStream_t>(copy_stream), device_index);
+
+  const size_t num_steps = batch_steps.size();
+  EventPool pool;
+  std::vector<cudaEvent_t> staging_done(num_steps, nullptr);
+  std::vector<cudaEvent_t> kernel_done(num_steps, nullptr);
+
+  // Entry edge: the first slot writes must not overwrite staging slots that
+  // work already enqueued on the compute stream (a previous plan, or the
+  // previous object group of this retrieve) is still reading.
+  {
+    cudaEvent_t entry_event = pool.create();
+    check_cuda(cudaEventRecord(entry_event, compute.stream()),
+               "cudaEventRecord(entry)");
+    check_cuda(cudaStreamWaitEvent(copy.stream(), entry_event, 0),
+               "cudaStreamWaitEvent(copy, entry)");
+  }
+
+  // Exit join: order the copy stream's tail before subsequent compute-stream
+  // work, so the caller's completion event (recorded on the compute stream
+  // after this call) covers every staging copy. This MUST run on all exit
+  // paths: the TORCH_CHECKs above sit between a step's staging and its
+  // launches, and an exception there would otherwise leave copies in flight
+  // that the caller's completion event does not cover — the caller would
+  // release the host buffers while the copy engine is still reading them.
+  // noexcept: runs inside catch-unwind; failures are logged, not thrown.
+  const auto join_streams = [&]() noexcept {
+    cudaEvent_t exit_event = nullptr;
+    if (cudaEventCreateWithFlags(&exit_event, cudaEventDisableTiming) !=
+        cudaSuccess) {
+      TORCH_WARN(
+          "execute_object_group_transfer: exit-join event creation "
+          "failed; falling back to cudaStreamSynchronize(copy)");
+      cudaStreamSynchronize(copy.stream());
+      return;
+    }
+    if (cudaEventRecord(exit_event, copy.stream()) != cudaSuccess ||
+        cudaStreamWaitEvent(compute.stream(), exit_event, 0) != cudaSuccess) {
+      TORCH_WARN(
+          "execute_object_group_transfer: exit-join enqueue failed; "
+          "falling back to cudaStreamSynchronize(copy)");
+      cudaStreamSynchronize(copy.stream());
+    }
+    cudaEventDestroy(exit_event);
+  };
+
+  try {
+    for (size_t i = 0; i < num_steps; ++i) {
+      const BatchStep& step = batch_steps[i];
+      TORCH_CHECK(step.wait_step < static_cast<int>(i), "BatchStep.wait_step (",
+                  step.wait_step, ") must reference an earlier step than ", i);
+      staging_done[i] = pool.create();
+      kernel_done[i] = pool.create();
+
+      if (is_h2d) {
+        // Slot edge: don't refill a slot set before its last reader is done.
+        if (step.wait_step >= 0) {
+          check_cuda(cudaStreamWaitEvent(copy.stream(),
+                                         kernel_done[step.wait_step], 0),
+                     "cudaStreamWaitEvent(copy, slot edge)");
+        }
+        {
+          const c10::cuda::CUDAStreamGuard copy_guard(copy);
+          do_staging(step.staging);
+        }
+        check_cuda(cudaEventRecord(staging_done[i], copy.stream()),
+                   "cudaEventRecord(staging_done)");
+        // Data edge: the kernels read what this step's staging wrote.
+        check_cuda(cudaStreamWaitEvent(compute.stream(), staging_done[i], 0),
+                   "cudaStreamWaitEvent(compute, data edge)");
+        run_launches(step);
+        check_cuda(cudaEventRecord(kernel_done[i], compute.stream()),
+                   "cudaEventRecord(kernel_done)");
+      } else {
+        // D2H mirror: the kernels WRITE the slots, so the slot edge guards
+        // them against the previous staging drain of the same slots; the
+        // data edge makes the staging drain wait for this step's kernels.
+        if (step.wait_step >= 0) {
+          check_cuda(cudaStreamWaitEvent(compute.stream(),
+                                         staging_done[step.wait_step], 0),
+                     "cudaStreamWaitEvent(compute, slot edge)");
+        }
+        run_launches(step);
+        check_cuda(cudaEventRecord(kernel_done[i], compute.stream()),
+                   "cudaEventRecord(kernel_done)");
+        check_cuda(cudaStreamWaitEvent(copy.stream(), kernel_done[i], 0),
+                   "cudaStreamWaitEvent(copy, data edge)");
+        {
+          const c10::cuda::CUDAStreamGuard copy_guard(copy);
+          do_staging(step.staging);
+        }
+        check_cuda(cudaEventRecord(staging_done[i], copy.stream()),
+                   "cudaEventRecord(staging_done)");
+      }
+    }
+  } catch (...) {
+    join_streams();
+    throw;
+  }
+  join_streams();
 }

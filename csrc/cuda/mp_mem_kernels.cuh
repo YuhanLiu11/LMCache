@@ -94,6 +94,10 @@ struct LaunchVar {
   int total_blocks;          // number of block ids for this launch
   int num_objects;           // chunks in this batch (1-4)
   int skip_prefix_n_blocks;
+  // First staging-slot index this launch reads: the launch consumes the
+  // group's lmcache_objects_ptrs[slot_offset, slot_offset + num_objects).
+  // 0 (the pre-pipeline behavior) when the plan does not rotate slot sets.
+  int slot_offset = 0;
 };
 
 // One batch: its staging copies and kernel launches. For H2D the staging runs
@@ -101,6 +105,13 @@ struct LaunchVar {
 struct BatchStep {
   std::vector<StagingCopy> staging;
   std::vector<LaunchVar> launches;
+  // Index of the earlier batch step that last used this step's staging slots.
+  // With a dedicated copy stream, this step's slot writes must wait for that
+  // step's opposite-side work (its kernels for H2D, its staging drain for
+  // D2H) before reusing the slots. -1 = no dependency (first user of the
+  // slot set). Ignored on the single-stream path, where stream order already
+  // serializes the reuse.
+  int wait_step = -1;
 };
 
 // Per-kernel-group invariants, resolved once on the Python side.
@@ -116,12 +127,33 @@ struct KernelGroupSpec {
 };
 
 /**
- * Execute one object group's transfer plan on the current CUDA stream.
+ * Execute one object group's transfer plan.
  *
  * Enqueues every staging copy and kernel launch described by `batch_steps`
  * within a single GIL release (configured at the pybind layer), eliminating the
  * per-copy/per-launch GIL handoffs of the equivalent Python loop. The device
- * guard and stream are set once for the whole plan.
+ * guard is set once for the whole plan.
+ *
+ * With `copy_stream == 0` (the default), everything runs on the current CUDA
+ * stream in plan order — the legacy single-stream behavior, byte-identical
+ * enqueue order.
+ *
+ * With a non-zero `copy_stream`, staging copies run on that stream while
+ * kernels stay on the current stream, coordinated by events so the copy
+ * engine never waits behind a stalled kernel:
+ *  - entry edge: the first staging copies wait for everything already
+ *    enqueued on the current stream (a previous plan may still be reading
+ *    the staging slots);
+ *  - data edge (per step): each step's kernels wait for its staging (H2D),
+ *    or its staging waits for its kernels (D2H);
+ *  - slot edge (per step): a step reusing staging slots waits for the prior
+ *    user recorded in `BatchStep.wait_step`;
+ *  - exit join: the current stream waits for the copy stream's tail, so a
+ *    completion event recorded on the current stream after this call covers
+ *    every copy. The join runs on ALL exit paths, including exceptions —
+ *    otherwise copies enqueued before a failed validation would still be in
+ *    flight, uncovered by the caller's completion event, when the caller
+ *    releases the host buffers.
  *
  * @param direction            H2D (retrieve) or D2H (store), applied to all ops
  * @param device               CUDA device of the transfer
@@ -129,12 +161,14 @@ struct KernelGroupSpec {
  *                              (power of two)
  * @param kernel_group_specs   Per-kernel-group invariants
  * @param batch_steps          Ordered per-batch staging + launch work
+ * @param copy_stream          Raw cudaStream_t for staging copies; 0 runs the
+ *                             whole plan on the current stream (legacy path)
  */
 void execute_object_group_transfer(
     TransferDirection direction, const torch::Device& device,
     size_t host_buffer_alignment,
     const std::vector<KernelGroupSpec>& kernel_group_specs,
-    const std::vector<BatchStep>& batch_steps);
+    const std::vector<BatchStep>& batch_steps, uintptr_t copy_stream = 0);
 
 /**
  * Block-level multi-layer KV transfer between vLLM paged buffers and

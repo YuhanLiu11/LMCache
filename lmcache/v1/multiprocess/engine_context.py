@@ -197,6 +197,12 @@ class MPCacheServerContext:
         separate_object_groups: Whether to split kernel groups into one object
             group per sliding-window size at KV-cache registration. Default
             False.
+        transfer_pipeline_depth: Staging slot sets in the dual-stream KV
+            transfer pipeline. 1 (default) keeps the legacy single-stream
+            transfer; see ``MPServerConfig.transfer_pipeline_depth``.
+
+    Raises:
+        ValueError: If ``transfer_pipeline_depth`` is < 1.
     """
 
     def __init__(
@@ -206,10 +212,16 @@ class MPCacheServerContext:
         hash_algorithm: str = "blake3",
         separate_object_groups: bool = False,
         full_sw_kv: bool = False,
+        transfer_pipeline_depth: int = 1,
     ) -> None:
+        if transfer_pipeline_depth < 1:
+            raise ValueError(
+                "transfer_pipeline_depth must be >= 1, got %d" % transfer_pipeline_depth
+            )
         self._chunk_size = chunk_size
         self._separate_object_groups = separate_object_groups
         self._full_sw_kv = full_sw_kv
+        self._transfer_pipeline_depth = transfer_pipeline_depth
 
         # Initialize the process-global GDS context.
         # No-op when GDS L1 is disabled (config is None).
@@ -250,6 +262,11 @@ class MPCacheServerContext:
     def full_sw_kv(self) -> bool:
         """Whether sliding-window groups cache full per-chunk KV (no window cutting)."""
         return self._full_sw_kv
+
+    @property
+    def transfer_pipeline_depth(self) -> int:
+        """Staging slot sets in the dual-stream KV transfer pipeline (1 = off)."""
+        return self._transfer_pipeline_depth
 
     @property
     def storage_manager(self) -> StorageManager:

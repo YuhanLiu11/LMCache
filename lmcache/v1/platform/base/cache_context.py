@@ -132,6 +132,34 @@ class BaseCacheContext(ABC):
     # ------------------------------------------------------------------
 
     @property
+    def transfer_pipeline_depth(self) -> int:
+        """Number of staging slot sets in the dual-stream transfer pipeline.
+
+        1 (the default for every platform without a dedicated copy stream)
+        means the pipeline is disabled and transfers run on the single
+        context stream. Platforms that support the pipeline override this.
+        """
+        return 1
+
+    @property
+    def num_ring_slots(self) -> int:
+        """Total staging slots: ``max_batch_size * transfer_pipeline_depth``.
+
+        The valid ``batch_idx`` range for the temp-buffer getters.
+        """
+        return self.max_batch_size * self.transfer_pipeline_depth
+
+    @property
+    def copy_stream_handle(self) -> int:
+        """Raw device-stream handle for dual-stream staging copies.
+
+        0 disables the pipeline: the native executor runs the whole plan on
+        the current stream (legacy path). Platforms with a dedicated copy
+        stream override this.
+        """
+        return 0
+
+    @property
     def device(self) -> torch.device:
         """Returns the device where KV-cache tensors live."""
         return self.device_

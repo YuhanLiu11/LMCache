@@ -72,7 +72,12 @@ class CPUCacheContext(BaseCacheContext):
         engine_type: EngineType = EngineType.VLLM,
         separate_object_groups: bool = False,
         full_sw_kv: bool = False,
+        transfer_pipeline_depth: int = 1,
     ) -> None:
+        # transfer_pipeline_depth is accepted for signature parity with the
+        # platform-agnostic factory; the CPU path has no dedicated copy
+        # stream, so it always runs single-stream (base-class defaults).
+        del transfer_pipeline_depth
         if not kv_caches:
             raise ValueError(
                 "CPUCacheContext requires a non-empty list of "

@@ -56,6 +56,15 @@ class MPServerConfig:
     sliding-window size at KV-cache registration (hybrid models). When False
     (default), all kernel groups share a single full-attention object group."""
 
+    transfer_pipeline_depth: int = 1
+    """Number of staging slot sets in the dual-stream KV transfer pipeline.
+    1 (default) keeps the legacy single-stream transfer. 2 overlaps each
+    retrieve batch step's host-to-device staging copies with the previous
+    step's scatter kernels on a dedicated copy stream, hiding GPU
+    kernel-start stalls (e.g. SM time-slicing with a co-located engine).
+    Costs one extra staging-buffer set per GPU per extra depth. CUDA-only;
+    other platforms fall back to single-stream."""
+
     enable_segmented_prefix: bool = False
     """CacheBlend only (engine_type='blend'): on a mid-prefix L2 retrieve
     failure, retain the gapped contiguous prefix so the post-gap chunks stay
@@ -375,6 +384,16 @@ def add_mp_server_args(
         "at KV-cache registration (for hybrid models). (Default is False)",
     )
     mp_group.add_argument(
+        "--transfer-pipeline-depth",
+        type=int,
+        default=1,
+        help="Staging slot sets in the dual-stream KV transfer pipeline. "
+        "1 (default) keeps the legacy single-stream transfer; 2 overlaps "
+        "retrieve staging copies with the previous step's scatter kernels "
+        "on a dedicated copy stream. Costs one extra staging-buffer set "
+        "per GPU per extra depth. CUDA-only.",
+    )
+    mp_group.add_argument(
         "--worker-reap-timeout-seconds",
         type=float,
         default=120.0,
@@ -439,6 +458,7 @@ def parse_args_to_mp_server_config(
         hash_algorithm=args.hash_algorithm,
         engine_type=args.engine_type,
         separate_object_groups=args.separate_object_groups,
+        transfer_pipeline_depth=args.transfer_pipeline_depth,
         enable_segmented_prefix=args.enable_segmented_prefix,
         supported_transfer_mode=args.supported_transfer_mode,
         runtime_plugin_config=RuntimePluginConfig(

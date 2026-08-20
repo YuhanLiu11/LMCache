@@ -67,6 +67,7 @@ def create_cache_context(
     engine_type: EngineType = EngineType.VLLM,
     separate_object_groups: bool = False,
     full_sw_kv: bool = False,
+    transfer_pipeline_depth: int = 1,
 ) -> BaseCacheContext:
     """Create the appropriate cache context for *kv_caches*.
 
@@ -95,6 +96,10 @@ def create_cache_context(
             per-chunk KV (no sub-chunk window cutting) so chunks stay valid for
             reuse at any position; see
             :meth:`KVLayerGroupsManager.enable_full_sw_kv`.
+        transfer_pipeline_depth: Staging slot sets in the dual-stream KV
+            transfer pipeline. 1 (default) keeps the legacy single-stream
+            transfer; platforms without a dedicated copy stream ignore
+            higher values and stay single-stream.
 
     Returns:
         A concrete cache context instance.
@@ -123,4 +128,5 @@ def create_cache_context(
         engine_type,
         separate_object_groups,
         full_sw_kv,
+        transfer_pipeline_depth=transfer_pipeline_depth,
     )

@@ -121,6 +121,7 @@ def _make_temp_buffer(
     max_batch_size: int = 4,
     num_blocks: int = 4,
     engine_group_infos: Sequence[EngineGroupInfo] = (),
+    pipeline_depth: int = 1,
 ) -> _TempGPUBuffer:
     """Build a ``_TempGPUBuffer`` backed by a real manager."""
     tensors = _make_kv_tensors(specs, num_blocks=num_blocks)
@@ -134,6 +135,7 @@ def _make_temp_buffer(
         lmcache_tokens_per_chunk=chunk_size,
         device=_DEVICE,
         max_batch_size=max_batch_size,
+        pipeline_depth=pipeline_depth,
     )
 
 
@@ -200,6 +202,7 @@ def _make_context(
     chunk_size: int = 256,
     num_blocks: int = 4,
     engine_group_infos: Sequence[EngineGroupInfo] = (),
+    transfer_pipeline_depth: int = 1,
 ) -> GPUCacheContext:
     """Build a real ``GPUCacheContext`` via its public constructor."""
     tensors = _make_kv_tensors(specs, num_blocks=num_blocks)
@@ -208,6 +211,7 @@ def _make_context(
         kv_caches,  # type: ignore
         lmcache_tokens_per_chunk=chunk_size,
         engine_group_infos=engine_group_infos,
+        transfer_pipeline_depth=transfer_pipeline_depth,
     )
 
 
@@ -431,6 +435,57 @@ class TestTempGPUBufferCacheSize:
         )
 
 
+class TestTempGPUBufferSlotRing:
+    """The dual-stream transfer pipeline's staging slot ring
+    (``pipeline_depth`` sets of ``max_batch_size`` slots)."""
+
+    def test_default_depth_is_one(self) -> None:
+        buf = _make_temp_buffer(_SINGLE_GROUP, max_batch_size=4)
+        assert buf.pipeline_depth == 1
+        assert buf.num_ring_slots == 4
+
+    def test_ring_slot_count(self) -> None:
+        buf = _make_temp_buffer(_SINGLE_GROUP, max_batch_size=4, pipeline_depth=2)
+        assert buf.pipeline_depth == 2
+        assert buf.num_ring_slots == 8
+
+    def test_invalid_depth_raises(self) -> None:
+        with pytest.raises(ValueError, match="pipeline_depth"):
+            _make_temp_buffer(_SINGLE_GROUP, pipeline_depth=0)
+
+    def test_allocation_scales_with_depth(self) -> None:
+        depth1 = _make_temp_buffer(_SINGLE_GROUP, pipeline_depth=1)
+        depth2 = _make_temp_buffer(_SINGLE_GROUP, pipeline_depth=2)
+        assert depth2.buffer.nbytes == 2 * depth1.buffer.nbytes
+
+    def test_second_slot_set_valid_and_disjoint(self) -> None:
+        """Slots 4..7 (depth 2) are addressable and share no bytes with
+        slots 0..3 or each other."""
+        tensors = _make_kv_tensors(_MULTI_GROUP)
+        manager = _build_manager(tensors)
+        buf = _TempGPUBuffer(manager, 256, _DEVICE, max_batch_size=4, pipeline_depth=2)
+        regions: list[tuple[int, int, str]] = []
+        for slot in range(buf.num_ring_slots):
+            for kg in range(manager.num_kernel_groups):
+                tensor = buf.get_temp_kernel_group_buffer(slot, kg)
+                start, end = _byte_region(tensor)
+                regions.append((start, end, f"slot={slot},kg={kg}"))
+        _assert_disjoint(regions)
+
+    def test_slot_past_ring_raises(self) -> None:
+        buf = _make_temp_buffer(_SINGLE_GROUP, max_batch_size=4, pipeline_depth=2)
+        buf.get_temp_kernel_group_buffer(7, 0)
+        with pytest.raises(ValueError, match="Invalid batch_idx"):
+            buf.get_temp_kernel_group_buffer(8, 0)
+
+    def test_cache_size_per_token_independent_of_depth(self) -> None:
+        """The reporting metric is per-chunk, not per-ring: depth must not
+        inflate it."""
+        depth1 = _make_temp_buffer(_SINGLE_GROUP, pipeline_depth=1)
+        depth2 = _make_temp_buffer(_SINGLE_GROUP, pipeline_depth=2)
+        assert depth1.get_cache_size_per_token() == depth2.get_cache_size_per_token()
+
+
 # ---------------------------------------------------------------------------
 # GPUCacheContext tests
 # ---------------------------------------------------------------------------
@@ -555,6 +610,34 @@ class TestGPUCacheContextReportStatus:
             assert group["slots_per_block"] == kernel_group.slots_per_block
             assert group["tokens_per_block"] == kernel_group.tokens_per_block
             assert 0 <= group["object_group_idx"] < manager.num_object_groups
+
+
+class TestGPUCacheContextTransferPipeline:
+    """Dual-stream transfer pipeline surface on ``GPUCacheContext``."""
+
+    def test_pipeline_disabled_by_default(self) -> None:
+        ctx = _make_context(_SINGLE_GROUP)
+        assert ctx.transfer_pipeline_depth == 1
+        assert ctx.num_ring_slots == ctx.max_batch_size
+        assert ctx.copy_stream_handle == 0
+
+    def test_pipeline_enabled(self) -> None:
+        ctx = _make_context(_SINGLE_GROUP, transfer_pipeline_depth=2)
+        assert ctx.transfer_pipeline_depth == 2
+        assert ctx.num_ring_slots == 2 * ctx.max_batch_size
+        assert ctx.copy_stream_handle != 0
+        # The copy stream is its own stream, not an alias of the main one.
+        assert ctx.copy_stream_handle != ctx.stream.cuda_stream
+
+    def test_invalid_depth_raises(self) -> None:
+        with pytest.raises(ValueError, match="transfer_pipeline_depth"):
+            _make_context(_SINGLE_GROUP, transfer_pipeline_depth=0)
+
+    def test_ring_slots_addressable(self) -> None:
+        ctx = _make_context(_MULTI_GROUP, transfer_pipeline_depth=2)
+        for slot in range(ctx.num_ring_slots):
+            for og in range(ctx.kv_layer_groups_manager.num_object_groups):
+                assert ctx.get_temp_object_group_buffer(slot, og).numel() > 0
 
 
 if __name__ == "__main__":

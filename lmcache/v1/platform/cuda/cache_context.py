@@ -106,13 +106,22 @@ class _TempGPUBuffer:
         lmcache_tokens_per_chunk: int,
         device: torch.device,
         max_batch_size: int = 4,
+        pipeline_depth: int = 1,
     ) -> None:
+        if pipeline_depth < 1:
+            raise ValueError("pipeline_depth must be >= 1, got %d" % pipeline_depth)
         self._kv_groups_manager = kv_layer_groups_manager
         self._lmcache_tokens_per_chunk = lmcache_tokens_per_chunk
         self._max_batch_size = max_batch_size
+        self._pipeline_depth = pipeline_depth
+        # The dual-stream transfer pipeline rotates through pipeline_depth
+        # sets of max_batch_size staging slots (a "slot ring") so one set can
+        # be refilled while another is still being read. Depth 1 is exactly
+        # the pre-pipeline layout.
+        self._num_ring_slots = max_batch_size * pipeline_depth
 
         self._temp_buffer = torch.empty(
-            self._get_size_for_single_batch() * max_batch_size,
+            self._get_size_for_single_batch() * self._num_ring_slots,
             dtype=torch.uint8,
             device=device,
         )
@@ -130,7 +139,7 @@ class _TempGPUBuffer:
         self._offset_map_object_group_only: dict[tuple[int, int], tuple[int, int]] = {}
 
         offset = 0
-        for batch_idx in range(max_batch_size):
+        for batch_idx in range(self._num_ring_slots):
             for object_group_idx in range(self._kv_groups_manager.num_object_groups):
                 object_group_size = 0
                 object_group_start_offset = offset
@@ -167,8 +176,21 @@ class _TempGPUBuffer:
     # Public APIs
     @property
     def max_batch_size(self) -> int:
-        """Maximum number of chunks (batch slots) the buffer holds."""
+        """Maximum number of chunks per batch step (one slot set)."""
         return self._max_batch_size
+
+    @property
+    def pipeline_depth(self) -> int:
+        """Number of slot sets in the staging ring (1 = no pipelining)."""
+        return self._pipeline_depth
+
+    @property
+    def num_ring_slots(self) -> int:
+        """Total staging slots: ``max_batch_size * pipeline_depth``.
+
+        Valid ``batch_idx`` range for the temp-buffer getters.
+        """
+        return self._num_ring_slots
 
     @property
     def buffer(self) -> torch.Tensor:
@@ -183,7 +205,7 @@ class _TempGPUBuffer:
         The returned buffer is with the correct shape and dtype for the kernel group.
 
         Args:
-            batch_idx: Index of the batch (0 <= batch_idx < max_batch_size)
+            batch_idx: Ring-slot index (0 <= batch_idx < num_ring_slots)
             kernel_group_idx: Index of the kernel group.
 
         Returns:
@@ -210,7 +232,7 @@ class _TempGPUBuffer:
         The returned buffer is a flat uint8 raw tensor.
 
         Args:
-            batch_idx: Index of the batch (0 <= batch_idx < max_batch_size)
+            batch_idx: Ring-slot index (0 <= batch_idx < num_ring_slots)
             object_group_idx: Index of the object group.
 
         Returns:
@@ -355,7 +377,32 @@ class GPUCacheContext(BaseCacheContext):
         engine_type: EngineType = EngineType.VLLM,
         separate_object_groups: bool = False,
         full_sw_kv: bool = False,
+        transfer_pipeline_depth: int = 1,
     ):
+        """Build a CUDA cache context from IPC-wrapped KV tensors.
+
+        Args:
+            kv_caches: KV cache tensor wrappers from the serving engine.
+            lmcache_tokens_per_chunk: Tokens per LMCache chunk.
+            layout_hints: Optional hints for KV format detection.
+            engine_group_infos: Engine-neutral KV cache group metadata.
+            engine_type: Which serving engine produced the caches.
+            separate_object_groups: Whether to split kernel groups into one
+                object group per sliding-window size.
+            full_sw_kv: Whether sliding-window groups store/transfer full
+                per-chunk KV (no sub-chunk window cutting).
+            transfer_pipeline_depth: Number of staging slot sets in the
+                dual-stream transfer pipeline. 1 (default) keeps the legacy
+                single-stream behavior; 2 lets staging copies of one batch
+                step overlap the scatter kernels of the previous step.
+
+        Raises:
+            ValueError: If ``transfer_pipeline_depth`` is < 1.
+        """
+        if transfer_pipeline_depth < 1:
+            raise ValueError(
+                "transfer_pipeline_depth must be >= 1, got %d" % transfer_pipeline_depth
+            )
         unwrapped = unwrap_kv_cache_tensors(kv_caches)
         kv_caches_norm, engine_kv_formats = normalize_and_discover_per_layer_formats(
             unwrapped,
@@ -403,15 +450,25 @@ class GPUCacheContext(BaseCacheContext):
             self.group_kv_pointers_.append(list_to_gpu_tensor(ptrs, self.device_))
 
         # Temporary GPU buffer for transfers — a single flat uint8 buffer
+        # holding transfer_pipeline_depth sets of max_batch_size staging slots.
         self._temp_buffer = _TempGPUBuffer(
             kv_layer_groups_manager=self.kv_layer_groups_manager_,
             lmcache_tokens_per_chunk=lmcache_tokens_per_chunk,
             device=self.device_,
             max_batch_size=4,
+            pipeline_depth=transfer_pipeline_depth,
         )
 
         # GPU streams
         self.cuda_stream_ = torch_dev.Stream(device=self.device_)
+        # Dedicated stream for staging copies in the dual-stream transfer
+        # pipeline; None at depth 1, where the whole plan stays on
+        # cuda_stream_ (see copy_stream_handle).
+        self.copy_stream_: Any = (
+            torch_dev.Stream(device=self.device_)
+            if transfer_pipeline_depth > 1
+            else None
+        )
 
         # Register the staging buffer with the GDS cuFile context on the
         # context's CUDA stream.
@@ -450,6 +507,27 @@ class GPUCacheContext(BaseCacheContext):
     @property
     def cupy_stream(self) -> "cupy.cuda.Stream":
         return self.cupy_stream_
+
+    @property
+    def transfer_pipeline_depth(self) -> int:
+        """Number of staging slot sets in the transfer pipeline (1 = off)."""
+        return self._temp_buffer.pipeline_depth
+
+    @property
+    def num_ring_slots(self) -> int:
+        """Total staging slots: ``max_batch_size * transfer_pipeline_depth``."""
+        return self._temp_buffer.num_ring_slots
+
+    @property
+    def copy_stream_handle(self) -> int:
+        """Raw ``cudaStream_t`` of the staging copy stream, as an int.
+
+        0 when the pipeline is disabled (depth 1); the native executor treats
+        0 as "run the whole plan on the current stream" (legacy path).
+        """
+        if self.copy_stream_ is None:
+            return 0
+        return self.copy_stream_.cuda_stream
 
     def get_kernel_group_kv_pointers(self, kernel_group_idx: int) -> torch.Tensor:
         """Returns the pre-computed GPU tensor of KV cache pointers for the
